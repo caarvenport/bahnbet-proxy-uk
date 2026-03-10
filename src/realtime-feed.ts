@@ -9,6 +9,8 @@
  * (TOCs), and deduplicate by serviceID.
  */
 
+import { getStopName } from "./static-feed.js";
+
 const HUXLEY_BASE =
   process.env.HUXLEY_URL || "https://huxley2.azurewebsites.net";
 
@@ -62,6 +64,9 @@ export interface TripUpdate {
   arrivalDelaySec: number | null;
   currentDelaySec: number | null;
   trainNumber: string | null;
+  originName: string | null;
+  destinationName: string | null;
+  scheduledArrival: string | null;
 }
 
 export interface FeedSnapshot {
@@ -195,6 +200,10 @@ export async function fetchAndFilter(): Promise<void> {
 
     const tripId = `darwin-${serviceID}`;
 
+    // Extract origin/destination names from Darwin service data
+    const originName = svc.origin?.[0]?.locationName ?? null;
+    const destinationName = svc.destination?.[0]?.locationName ?? null;
+
     trips[tripId] = {
       tripId,
       routeId: operatorCode,
@@ -207,6 +216,9 @@ export async function fetchAndFilter(): Promise<void> {
       arrivalDelaySec: null,
       currentDelaySec: delaySec,
       trainNumber: trainNum || null,
+      originName,
+      destinationName,
+      scheduledArrival: null,
     };
   }
 
