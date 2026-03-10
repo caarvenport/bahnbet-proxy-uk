@@ -1,19 +1,16 @@
 /**
- * Fetches real-time train delay data from Darwin LDBWS (Live Departure Boards).
+ * Fetches real-time train delay data from Darwin via Huxley2 REST proxy.
  *
- * Darwin is National Rail's official real-time API. It provides departure/arrival
- * boards per station via a SOAP/XML endpoint. We poll ~15 major UK stations every
- * 90s, filter to long-distance operators (TOCs), and deduplicate by serviceID.
+ * Huxley2 (huxley2.azurewebsites.net) is a free, public JSON wrapper around
+ * National Rail's Darwin LDBWS API. It returns departure boards in clean JSON
+ * with no API key required.
  *
- * The SOAP envelope is simple enough to build by hand -- no XML library needed.
- * Responses are parsed with regex extraction (the XML structure is predictable).
- *
- * Requires DARWIN_API_KEY env var (register at realtime.nationalrail.co.uk).
+ * We poll ~15 major UK stations every 90s, filter to long-distance operators
+ * (TOCs), and deduplicate by serviceID.
  */
 
-const API_KEY = process.env.DARWIN_API_KEY || "";
-const DARWIN_URL =
-  "https://lite.realtime.nationalrail.co.uk/OpenLDBWS/ldb12.asmx";
+const HUXLEY_BASE =
+  process.env.HUXLEY_URL || "https://huxley2.azurewebsites.net";
 
 // -- Long-distance TOC codes ------------------------------------------------
 
@@ -28,6 +25,7 @@ const LD_TOCS = new Set([
   "GC", // Grand Central (London-Sunderland/Bradford)
   "LE", // Greater Anglia (London-Norwich)
   "ES", // Eurostar (London-Paris/Brussels)
+  "LD", // Lumo (London-Edinburgh low-cost)
 ]);
 
 // -- Major stations to poll -------------------------------------------------
@@ -86,34 +84,38 @@ export function getSnapshot() {
   return latest;
 }
 
-// -- Darwin service record from XML -----------------------------------------
+// -- Huxley2 response types ------------------------------------------------
 
-interface DarwinService {
-  serviceID: string;
-  rsid: string; // Retail Service ID (e.g. "VT123400")
-  std: string; // Scheduled time of departure "HH:MM"
-  etd: string; // "On time", "HH:MM", "Cancelled", "Delayed"
-  sta: string; // Scheduled time of arrival (at this station)
-  eta: string; // Estimated time of arrival
-  operator: string; // e.g. "Avanti West Coast"
-  operatorCode: string; // e.g. "VT"
-  platform: string;
-  destinations: string[]; // destination station names
-  origins: string[]; // origin station names
-  trainid: string; // headcode / train identity (e.g. "1A23")
-  isCancelled: boolean;
+interface HuxleyService {
+  serviceIdUrlSafe?: string;
+  serviceID?: string;
+  rsid?: string;
+  std?: string;
+  etd?: string;
+  sta?: string;
+  eta?: string;
+  operator?: string;
+  operatorCode?: string;
+  platform?: string;
+  trainid?: string;
+  isCancelled?: boolean;
+  destination?: Array<{ locationName?: string; crs?: string }>;
+  origin?: Array<{ locationName?: string; crs?: string }>;
+}
+
+interface HuxleyResponse {
+  trainServices?: HuxleyService[] | null;
+  busServices?: unknown[] | null;
+  generatedAt?: string;
+  locationName?: string;
+  crs?: string;
 }
 
 // -- Fetch & filter ---------------------------------------------------------
 
 export async function fetchAndFilter(): Promise<void> {
-  if (!API_KEY) {
-    console.warn("[rt] DARWIN_API_KEY not set -- skipping RT fetch");
-    return;
-  }
-
   const t0 = Date.now();
-  console.log(`[rt] Polling ${STATIONS.length} stations via Darwin LDBWS...`);
+  console.log(`[rt] Polling ${STATIONS.length} stations via Huxley2...`);
 
   // Build today's date string in UK timezone
   const now = new Date();
@@ -130,7 +132,7 @@ export async function fetchAndFilter(): Promise<void> {
   const todayStr = `${year}${month}${day}`;
 
   // Poll all stations concurrently (with concurrency limit)
-  const allServices: DarwinService[] = [];
+  const allServices: HuxleyService[] = [];
   const CONCURRENCY = 5;
   let stationsPolled = 0;
 
@@ -154,55 +156,55 @@ export async function fetchAndFilter(): Promise<void> {
   );
 
   // Filter to long-distance TOCs
-  const ldServices = allServices.filter((s) => LD_TOCS.has(s.operatorCode));
+  const ldServices = allServices.filter((s) =>
+    LD_TOCS.has(s.operatorCode ?? ""),
+  );
 
   // Deduplicate by serviceID (same train appears at multiple stations)
-  const deduped = new Map<string, DarwinService>();
+  const deduped = new Map<string, HuxleyService>();
   for (const svc of ldServices) {
-    if (!svc.serviceID) continue;
-    // Keep the first occurrence (origin station is typically polled first)
-    if (!deduped.has(svc.serviceID)) {
-      deduped.set(svc.serviceID, svc);
+    const id = svc.serviceIdUrlSafe ?? svc.serviceID ?? "";
+    if (!id) continue;
+    if (!deduped.has(id)) {
+      deduped.set(id, svc);
     }
   }
 
   // Build trip updates
   const trips: Record<string, TripUpdate> = {};
   for (const [serviceID, svc] of deduped) {
-    const delaySec = parseDelay(svc.std, svc.etd);
-    const cancelled = svc.isCancelled || svc.etd === "Cancelled";
+    const std = svc.std ?? "";
+    const etd = svc.etd ?? "";
+    const delaySec = parseDelay(std, etd);
+    const cancelled = svc.isCancelled === true || etd === "Cancelled";
 
-    // Train identity: prefer rsid, fall back to trainid (headcode)
-    const trainNum = svc.rsid || svc.trainid || "";
-    const dest =
-      svc.destinations.length > 0 ? svc.destinations[0] : "Unknown";
+    const operatorCode = svc.operatorCode ?? "";
+    const trainNum = svc.rsid ?? svc.trainid ?? "";
+    const headcode = svc.trainid ?? "";
+    const dest = svc.destination?.[0]?.locationName ?? "Unknown";
 
-    // lineName: "VT 1A23 to Manchester Piccadilly" or "LNER to Edinburgh"
-    const headcode = svc.trainid || "";
     const lineName = headcode
-      ? `${svc.operatorCode} ${headcode}`
-      : `${svc.operatorCode} to ${dest}`;
+      ? `${operatorCode} ${headcode}`
+      : `${operatorCode} to ${dest}`;
 
-    // runId: "VT-1A23-20260310-1430"
-    const depHHMM = svc.std.replace(":", "");
+    const depHHMM = std.replace(":", "");
     const runId =
-      svc.operatorCode && todayStr
-        ? `${svc.operatorCode}-${headcode || serviceID.slice(0, 8)}-${todayStr}-${depHHMM}`
+      operatorCode && todayStr
+        ? `${operatorCode}-${headcode || serviceID.slice(0, 8)}-${todayStr}-${depHHMM}`
         : "";
 
-    // tripId: use serviceID (Darwin's unique identifier for this service today)
     const tripId = `darwin-${serviceID}`;
 
     trips[tripId] = {
       tripId,
-      routeId: svc.operatorCode,
+      routeId: operatorCode,
       lineName,
       startDate: todayStr,
-      startTime: svc.std,
+      startTime: std,
       runId,
       cancelled,
       departureDelaySec: delaySec,
-      arrivalDelaySec: null, // departure boards don't give arrival delay at final dest
+      arrivalDelaySec: null,
       currentDelaySec: delaySec,
       trainNumber: trainNum || null,
     };
@@ -229,152 +231,24 @@ export async function fetchAndFilter(): Promise<void> {
   );
 }
 
-// -- Darwin LDBWS SOAP call -------------------------------------------------
+// -- Huxley2 REST call ------------------------------------------------------
 
-async function fetchDepartureBoard(crs: string): Promise<DarwinService[]> {
-  const soapBody = buildSoapEnvelope(crs);
+async function fetchDepartureBoard(crs: string): Promise<HuxleyService[]> {
+  const url = `${HUXLEY_BASE}/departures/${crs}/50?expand=true`;
 
-  const res = await fetch(DARWIN_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "text/xml; charset=utf-8",
-      SOAPAction:
-        "http://thalesgroup.com/RTTI/2012-01-13/ldb/GetDepartureBoardByCRS",
-    },
-    body: soapBody,
+  const res = await fetch(url, {
+    method: "GET",
+    headers: { Accept: "application/json" },
     signal: AbortSignal.timeout(15_000),
   });
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`Darwin ${crs} failed: ${res.status} ${text.slice(0, 200)}`);
+    throw new Error(`Huxley ${crs} failed: ${res.status} ${text.slice(0, 200)}`);
   }
 
-  const xml = await res.text();
-  return parseServicesFromXml(xml);
-}
-
-function buildSoapEnvelope(crs: string): string {
-  return `<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
-               xmlns:typ="http://thalesgroup.com/RTTI/2013-11-28/Token/types"
-               xmlns:ldb="http://thalesgroup.com/RTTI/2017-10-01/ldb/">
-  <soap:Header>
-    <typ:AccessToken>
-      <typ:TokenValue>${escapeXml(API_KEY)}</typ:TokenValue>
-    </typ:AccessToken>
-  </soap:Header>
-  <soap:Body>
-    <ldb:GetDepartureBoardRequest>
-      <ldb:numRows>50</ldb:numRows>
-      <ldb:crs>${escapeXml(crs)}</ldb:crs>
-      <ldb:timeWindow>120</ldb:timeWindow>
-    </ldb:GetDepartureBoardRequest>
-  </soap:Body>
-</soap:Envelope>`;
-}
-
-// -- XML parsing (regex-based, no dependencies) -----------------------------
-
-function parseServicesFromXml(xml: string): DarwinService[] {
-  const services: DarwinService[] = [];
-
-  // Extract each <lt7:service>...</lt7:service> block
-  // Darwin uses various namespace prefixes (lt7, lt5, lt4, lt, etc.)
-  // Match any namespace prefix for the service element
-  const serviceRegex =
-    /<(?:[a-z0-9]+:)?service>([\s\S]*?)<\/(?:[a-z0-9]+:)?service>/gi;
-  let match: RegExpExecArray | null;
-
-  while ((match = serviceRegex.exec(xml)) !== null) {
-    const block = match[1];
-    const svc = parseServiceBlock(block);
-    if (svc) {
-      services.push(svc);
-    }
-  }
-
-  return services;
-}
-
-function parseServiceBlock(block: string): DarwinService | null {
-  const serviceID = extractTag(block, "serviceID");
-  if (!serviceID) return null;
-
-  const std = extractTag(block, "std") || "";
-  const etd = extractTag(block, "etd") || "";
-  const sta = extractTag(block, "sta") || "";
-  const eta = extractTag(block, "eta") || "";
-  const operator = extractTag(block, "operator") || "";
-  const operatorCode = extractTag(block, "operatorCode") || "";
-  const platform = extractTag(block, "platform") || "";
-  const rsid = extractTag(block, "rsid") || "";
-  const trainid = extractTag(block, "trainid") || "";
-  const isCancelled =
-    extractTag(block, "isCancelled")?.toLowerCase() === "true" ||
-    extractTag(block, "cancelReason") !== null;
-
-  // Extract destination names
-  const destinations = extractLocationNames(block, "destination");
-  // Extract origin names
-  const origins = extractLocationNames(block, "origin");
-
-  return {
-    serviceID,
-    rsid,
-    std,
-    etd,
-    sta,
-    eta,
-    operator,
-    operatorCode,
-    platform,
-    destinations,
-    origins,
-    trainid,
-    isCancelled,
-  };
-}
-
-/**
- * Extract a tag value, handling any namespace prefix.
- * e.g. <lt4:std>14:30</lt4:std> or <std>14:30</std>
- */
-function extractTag(xml: string, tagName: string): string | null {
-  const regex = new RegExp(
-    `<(?:[a-z0-9]+:)?${tagName}>([\\s\\S]*?)<\\/(?:[a-z0-9]+:)?${tagName}>`,
-    "i",
-  );
-  const m = regex.exec(xml);
-  return m ? m[1].trim() : null;
-}
-
-/**
- * Extract location names from <destination> or <origin> blocks.
- * These contain <location> elements with <locationName> children.
- */
-function extractLocationNames(
-  xml: string,
-  containerTag: string,
-): string[] {
-  const names: string[] = [];
-  // Find the container block (e.g. <lt5:destination>...</lt5:destination>)
-  const containerRegex = new RegExp(
-    `<(?:[a-z0-9]+:)?${containerTag}>([\\s\\S]*?)<\\/(?:[a-z0-9]+:)?${containerTag}>`,
-    "i",
-  );
-  const containerMatch = containerRegex.exec(xml);
-  if (!containerMatch) return names;
-
-  const inner = containerMatch[1];
-  // Extract each locationName
-  const nameRegex =
-    /<(?:[a-z0-9]+:)?locationName>([^<]+)<\/(?:[a-z0-9]+:)?locationName>/gi;
-  let m: RegExpExecArray | null;
-  while ((m = nameRegex.exec(inner)) !== null) {
-    names.push(m[1].trim());
-  }
-  return names;
+  const data: HuxleyResponse = await res.json();
+  return data.trainServices ?? [];
 }
 
 // -- Delay parsing ----------------------------------------------------------
@@ -399,39 +273,19 @@ function parseDelay(std: string, etd: string): number | null {
     return null;
   }
 
-  // etd is "HH:MM" -- compute difference from std
   const schedMin = parseTimeToMinutes(std);
   const estMin = parseTimeToMinutes(etd);
   if (schedMin === null || estMin === null) return null;
 
   let diffMin = estMin - schedMin;
+  if (diffMin < -720) diffMin += 1440;
+  if (diffMin < 0) diffMin = 0;
 
-  // Handle midnight crossing: if estimated is much earlier than scheduled,
-  // it's likely the next day (e.g. scheduled 23:50, estimated 00:05 = +15 min)
-  if (diffMin < -720) {
-    diffMin += 1440;
-  }
-  // If diff is hugely negative (e.g. -5), it might be rounding or early arrival
-  // but Darwin doesn't report early departures this way, so clamp to 0
-  if (diffMin < 0) {
-    diffMin = 0;
-  }
-
-  return diffMin * 60; // convert to seconds
+  return diffMin * 60;
 }
 
 function parseTimeToMinutes(time: string): number | null {
   const m = /^(\d{1,2}):(\d{2})$/.exec(time.trim());
   if (!m) return null;
   return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
-}
-
-// -- Helpers ----------------------------------------------------------------
-
-function escapeXml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
 }
